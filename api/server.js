@@ -4,7 +4,7 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 const express = require("express");
-const { Pool } = require("pg");             // 👈 pg en lugar de mysql2
+const { Pool } = require("pg");             
 const cors = require("cors");
 const multer = require("multer");
 const bcrypt = require("bcryptjs");
@@ -16,12 +16,10 @@ const app = express();
 const SECRET_KEY = process.env.JWT_SECRET || "mi_clave_secreta_jwt";
 
 // ---------- POOL DE CONEXIONES (PostgreSQL / Neon) ----------
-// Neon requiere SSL. La URL de DATABASE_URL ya viene con ?sslmode=require,
-// pero pasamos `ssl` explícito por compatibilidad con todos los entornos.
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
     ssl: { rejectUnauthorized: false },
-    max: 2,                       // equivale al connectionLimit de mysql2
+    max: 2,                       
     idleTimeoutMillis: 60000,
     connectionTimeoutMillis: 10000,
 });
@@ -147,10 +145,9 @@ app.get("/incidencias", async (req, res) => {
             WHERE 1=1
         `;
         const parametros = [];
-        let idx = 1; // contador para $1, $2, $3...
+        let idx = 1;
 
         if (buscar) {
-            // ILIKE = case-insensitive, equivalente al LIKE de MySQL
             sql += ` AND i.descripcion ILIKE $${idx++}`;
             parametros.push(`%${buscar}%`);
         }
@@ -184,7 +181,6 @@ app.get("/incidencias/exportar", async (req, res) => {
         const parametros = [];
 
         if (fecha_inicio && fecha_fin) {
-            // ::date es el cast idiomático de PostgreSQL
             sql += " AND i.fecha::date BETWEEN $1::date AND $2::date";
             parametros.push(fecha_inicio, fecha_fin);
         }
@@ -218,22 +214,25 @@ app.get("/incidencias/resueltas", async (req, res) => {
 // ========== POST /incidencias con Vercel Blob ==========
 app.post("/incidencias", upload.single("imagen"), async (req, res) => {
     try {
+        // Diagnóstico temporal para Vercel Logs
+        console.log("¿Token de Blob detectado?:", process.env.BLOB_READ_WRITE_TOKEN ? "SÍ" : "NO");
+
         const { categoria_id, descripcion, usuario_id } = req.body;
         let imagenUrl = null;
 
-        // Si se subió una imagen, la enviamos a Vercel Blob (sin cambios)
         if (req.file) {
             const nombreArchivo = `incidencias/${Date.now()}-${req.file.originalname}`;
 
+            // 👇 AQUI ESTÁ LA CORRECCIÓN: Pasamos el token explícitamente
             const blob = await put(nombreArchivo, req.file.buffer, {
                 access: 'public',
-                contentType: req.file.mimetype
+                contentType: req.file.mimetype,
+                token: process.env.BLOB_READ_WRITE_TOKEN
             });
 
             imagenUrl = blob.url;
         }
 
-        // RETURNING id reemplaza al insertId de MySQL
         const sql = `
             INSERT INTO incidencias (usuario_id, categoria_id, descripcion, imagen)
             VALUES ($1, $2, $3, $4)
