@@ -4,41 +4,37 @@ if (process.env.NODE_ENV !== 'production') {
 }
 
 const express = require("express");
-const mysql = require("mysql2");
+const { Pool } = require("pg");             // 👈 pg en lugar de mysql2
 const cors = require("cors");
 const multer = require("multer");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
-const { put } = require('@vercel/blob'); // 👈 Vercel Blob
+const { put } = require('@vercel/blob');
 const { attachDatabasePool } = require('@vercel/functions');
 
 const app = express();
 const SECRET_KEY = process.env.JWT_SECRET || "mi_clave_secreta_jwt";
 
-app.use(cors());
-app.use(express.json({ limit: '10mb' }));
-
-// ---------- POOL DE CONEXIONES (compatible con Vercel) ----------
-const pool = mysql.createPool({
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    database: process.env.DB_DATABASE,
-    port: process.env.DB_PORT ? parseInt(process.env.DB_PORT, 10) : 3306,
-    waitForConnections: true,
-    connectionLimit: 2,
-    queueLimit: 0,
-    idleTimeout: 60000
+// ---------- POOL DE CONEXIONES (PostgreSQL / Neon) ----------
+// Neon requiere SSL. La URL de DATABASE_URL ya viene con ?sslmode=require,
+// pero pasamos `ssl` explícito por compatibilidad con todos los entornos.
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: { rejectUnauthorized: false },
+    max: 2,                       // equivale al connectionLimit de mysql2
+    idleTimeoutMillis: 60000,
+    connectionTimeoutMillis: 10000,
 });
 
 attachDatabasePool(pool);
 
-const db = pool.promise();
+app.use(cors());
+app.use(express.json({ limit: '10mb' }));
 
 // ---------- MULTER: memoria (el archivo se sube a Vercel Blob) ----------
 const upload = multer({
     storage: multer.memoryStorage(),
-    limits: { fileSize: 4 * 1024 * 1024 } // 4 MB (límite de Vercel Functions es 4.5 MB)
+    limits: { fileSize: 4 * 1024 * 1024 } // 4 MB
 });
 
 // ---------- MIDDLEWARE JWT ----------
@@ -59,8 +55,8 @@ app.post("/registro", async (req, res) => {
     try {
         const { nombre, email, password, rol } = req.body;
         const hash = await bcrypt.hash(password, 10);
-        const sql = "INSERT INTO usuarios (nombre, email, password, rol) VALUES (?, ?, ?, ?)";
-        await db.query(sql, [nombre, email, hash, rol || "Usuario"]);
+        const sql = "INSERT INTO usuarios (nombre, email, password, rol) VALUES ($1, $2, $3, $4)";
+        await pool.query(sql, [nombre, email, hash, rol || "Usuario"]);
         res.json({ mensaje: "Usuario registrado con éxito" });
     } catch (error) {
         console.error("Error en /registro:", error);
@@ -71,13 +67,16 @@ app.post("/registro", async (req, res) => {
 app.post("/login", async (req, res) => {
     try {
         const { email, password } = req.body;
-        const [resultado] = await db.query("SELECT * FROM usuarios WHERE email = ?", [email]);
+        const { rows } = await pool.query(
+            "SELECT * FROM usuarios WHERE email = $1",
+            [email]
+        );
 
-        if (resultado.length === 0) {
+        if (rows.length === 0) {
             return res.status(404).json({ mensaje: "Usuario no encontrado" });
         }
 
-        const usuario = resultado[0];
+        const usuario = rows[0];
         const passwordValida = await bcrypt.compare(password, usuario.password);
 
         if (!passwordValida) {
@@ -109,15 +108,15 @@ app.post("/login", async (req, res) => {
 app.get("/perfil", verificarToken, async (req, res) => {
     try {
         const usuarioId = req.usuario.id;
-        const [resultado] = await db.query(
-            "SELECT id, nombre, email, rol FROM usuarios WHERE id = ?",
+        const { rows } = await pool.query(
+            "SELECT id, nombre, email, rol FROM usuarios WHERE id = $1",
             [usuarioId]
         );
 
-        if (resultado.length === 0) {
+        if (rows.length === 0) {
             return res.status(404).json({ mensaje: "Usuario no encontrado" });
         }
-        res.json(resultado[0]);
+        res.json(rows[0]);
     } catch (error) {
         console.error("Error en /perfil:", error);
         res.status(500).json({ error: error.message });
@@ -128,7 +127,7 @@ app.get("/perfil", verificarToken, async (req, res) => {
 
 app.get("/categorias", async (req, res) => {
     try {
-        const [rows] = await db.query("SELECT * FROM categorias");
+        const { rows } = await pool.query("SELECT * FROM categorias ORDER BY id");
         res.json(rows);
     } catch (error) {
         console.error("Error en /categorias:", error);
@@ -148,22 +147,24 @@ app.get("/incidencias", async (req, res) => {
             WHERE 1=1
         `;
         const parametros = [];
+        let idx = 1; // contador para $1, $2, $3...
 
         if (buscar) {
-            sql += " AND i.descripcion LIKE ?";
+            // ILIKE = case-insensitive, equivalente al LIKE de MySQL
+            sql += ` AND i.descripcion ILIKE $${idx++}`;
             parametros.push(`%${buscar}%`);
         }
         if (categoria_id) {
-            sql += " AND i.categoria_id = ?";
+            sql += ` AND i.categoria_id = $${idx++}`;
             parametros.push(categoria_id);
         }
         if (estado) {
-            sql += " AND i.estado = ?";
+            sql += ` AND i.estado = $${idx++}`;
             parametros.push(estado);
         }
         sql += " ORDER BY i.fecha DESC";
 
-        const [rows] = await db.query(sql, parametros);
+        const { rows } = await pool.query(sql, parametros);
         res.json(rows);
     } catch (error) {
         console.error("Error en GET /incidencias:", error);
@@ -183,12 +184,13 @@ app.get("/incidencias/exportar", async (req, res) => {
         const parametros = [];
 
         if (fecha_inicio && fecha_fin) {
-            sql += " AND DATE(i.fecha) BETWEEN ? AND ?";
+            // ::date es el cast idiomático de PostgreSQL
+            sql += " AND i.fecha::date BETWEEN $1::date AND $2::date";
             parametros.push(fecha_inicio, fecha_fin);
         }
         sql += " ORDER BY i.fecha DESC";
 
-        const [rows] = await db.query(sql, parametros);
+        const { rows } = await pool.query(sql, parametros);
         res.json(rows);
     } catch (error) {
         console.error("Error en /incidencias/exportar:", error);
@@ -205,7 +207,7 @@ app.get("/incidencias/resueltas", async (req, res) => {
             WHERE i.estado = 'Resuelto'
             ORDER BY i.fecha DESC
         `;
-        const [rows] = await db.query(sql);
+        const { rows } = await pool.query(sql);
         res.json(rows);
     } catch (error) {
         console.error("Error en /incidencias/resueltas:", error);
@@ -219,7 +221,7 @@ app.post("/incidencias", upload.single("imagen"), async (req, res) => {
         const { categoria_id, descripcion, usuario_id } = req.body;
         let imagenUrl = null;
 
-        // Si se subió una imagen, la enviamos a Vercel Blob
+        // Si se subió una imagen, la enviamos a Vercel Blob (sin cambios)
         if (req.file) {
             const nombreArchivo = `incidencias/${Date.now()}-${req.file.originalname}`;
 
@@ -228,11 +230,16 @@ app.post("/incidencias", upload.single("imagen"), async (req, res) => {
                 contentType: req.file.mimetype
             });
 
-            imagenUrl = blob.url; // URL pública en la CDN de Vercel
+            imagenUrl = blob.url;
         }
 
-        const sql = "INSERT INTO incidencias (usuario_id, categoria_id, descripcion, imagen) VALUES (?, ?, ?, ?)";
-        const [resultado] = await db.query(sql, [
+        // RETURNING id reemplaza al insertId de MySQL
+        const sql = `
+            INSERT INTO incidencias (usuario_id, categoria_id, descripcion, imagen)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id
+        `;
+        const { rows } = await pool.query(sql, [
             usuario_id || null,
             categoria_id,
             descripcion,
@@ -241,7 +248,7 @@ app.post("/incidencias", upload.single("imagen"), async (req, res) => {
 
         res.json({
             mensaje: "Incidencia registrada correctamente",
-            id: resultado.insertId,
+            id: rows[0].id,
             imagen: imagenUrl
         });
     } catch (error) {
@@ -254,7 +261,10 @@ app.put("/incidencias/:id/estado", verificarToken, async (req, res) => {
     try {
         const { id } = req.params;
         const { estado } = req.body;
-        await db.query("UPDATE incidencias SET estado = ? WHERE id = ?", [estado, id]);
+        await pool.query(
+            "UPDATE incidencias SET estado = $1 WHERE id = $2",
+            [estado, id]
+        );
         res.json({ mensaje: "Estado actualizado correctamente" });
     } catch (error) {
         console.error("Error en PUT /incidencias/:id/estado:", error);
@@ -268,7 +278,7 @@ app.delete("/incidencias/:id", verificarToken, async (req, res) => {
             return res.status(403).json({ mensaje: "Acceso denegado: Requiere rol Admin" });
         }
         const { id } = req.params;
-        await db.query("DELETE FROM incidencias WHERE id = ?", [id]);
+        await pool.query("DELETE FROM incidencias WHERE id = $1", [id]);
         res.json({ mensaje: "Incidencia eliminada correctamente" });
     } catch (error) {
         console.error("Error en DELETE /incidencias/:id:", error);
@@ -281,12 +291,13 @@ app.delete("/incidencias/:id", verificarToken, async (req, res) => {
 app.get("/estadisticas/categorias", async (req, res) => {
     try {
         const sql = `
-            SELECT c.nombre AS categoria, COUNT(i.id) AS total
+            SELECT c.nombre AS categoria, COUNT(i.id)::int AS total
             FROM categorias c
             LEFT JOIN incidencias i ON c.id = i.categoria_id
             GROUP BY c.id, c.nombre
+            ORDER BY c.id
         `;
-        const [rows] = await db.query(sql);
+        const { rows } = await pool.query(sql);
         res.json(rows);
     } catch (error) {
         console.error("Error en /estadisticas/categorias:", error);
@@ -297,11 +308,11 @@ app.get("/estadisticas/categorias", async (req, res) => {
 app.get("/estadisticas/estados", async (req, res) => {
     try {
         const sql = `
-            SELECT estado, COUNT(id) AS total
+            SELECT estado, COUNT(id)::int AS total
             FROM incidencias
             GROUP BY estado
         `;
-        const [rows] = await db.query(sql);
+        const { rows } = await pool.query(sql);
         res.json(rows);
     } catch (error) {
         console.error("Error en /estadisticas/estados:", error);
